@@ -1,3 +1,5 @@
 ebin
+*.swp
+src/*.swp
 erl_crash.dump
 deps

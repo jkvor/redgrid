@@ -29,12 +29,12 @@ start_link() ->
 
 init(Parent) ->
     Opts = redis_opts(),
-    log(debug, "Redis opts: ~p", [Opts]),
+    log(debug, "Redis opts: ~p~n", [Opts]),
     {ok, Pid} = redo:start_link(undefined, Opts),
     BinNode = atom_to_binary(node(), utf8),
     Ip = local_ip(),
     Domain = domain(),
-    log(debug, "Loop args: node=~s ip=~s domain=~s", [BinNode, Ip, Domain]),
+    log(debug, "Loop args: node=~s ip=~s domain=~s~n", [BinNode, Ip, Domain]),
     proc_lib:init_ack(Parent, {ok, self()}),
     loop(Pid, BinNode, Ip, Domain).
 
@@ -65,7 +65,7 @@ connect(Pid, Key, Size) ->
         <<"redgrid:", _:Size/binary, ":", BinNode/binary>> ->
             connect1(Pid, Key, binary_to_list(BinNode));
         _ ->
-            log(debug, "Attempting to connect to invalid key: ~s", [Key])
+            log(debug, "Attempting to connect to invalid key: ~s~n", [Key])
     end.
 
 connect1(Pid, Key, StrNode) ->
@@ -85,7 +85,7 @@ connect2(Pid, Key, StrNode, Node) ->
         Ip when is_binary(Ip) ->
             connect3(StrNode, Node, Ip);
         Other ->
-            log(debug, "Failed to lookup node ip with key ~s: ~p", [Key, Other])
+            log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other])
     end.
 
 connect3(StrNode, Node, Ip) ->
@@ -95,20 +95,20 @@ connect3(StrNode, Node, Ip) ->
                 {match, [Host]} ->
                     connect4(Node, Addr, Host);   
                 Other ->
-                    log(debug, "Failed to parse host ~s: ~p", [StrNode, Other])
+                    log(debug, "Failed to parse host ~s: ~p~n", [StrNode, Other])
             end;
         Err ->
-            log(debug, "Failed to resolve ip ~s: ~p", [Ip, Err])
+            log(debug, "Failed to resolve ip ~s: ~p~n", [Ip, Err])
     end.
 
 connect4(Node, Addr, Host) ->
     inet_db:add_host(Addr, [Host]),
     case net_adm:ping(Node) of
         pong ->
-            log(debug, "Monitoring node ~p", [Node]),
+            log(debug, "Monitoring node ~p~n", [Node]),
             erlang:monitor_node(Node, true);
         pang ->
-            log(debug, "Ping failed ~p ~s -> ~p", [Node, Addr, Host])
+            log(debug, "Ping failed ~p ~s -> ~p~n", [Node, Addr, Host])
     end.
 
 get_node(Pid, Key) ->
