@@ -1,0 +1,9 @@
+{application, redgrid,
+ [
+  {description, "Erlang node manager (redis backend)"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [kernel,stdlib]},
+  {mod, {redgrid_app, []}},
+  {env, []}
+ ]}.
