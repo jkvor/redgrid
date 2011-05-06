@@ -21,61 +21,151 @@
 %% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 %% OTHER DEALINGS IN THE SOFTWARE.
 -module(redgrid).
--export([start_link/0, init/1, loop/4]).
--compile(export_all).
+-behaviour(gen_server).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2, code_change/3]).
+
+-export([start_link/0, register_node/0, connect_nodes/0, registered_nodes/0]).
+
+-record(state, {redis_cli, bin_node, ip, domain, version, nodes=[]}).
 
 start_link() ->
-    proc_lib:start_link(?MODULE, init, [self()]).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-init(Parent) ->
+register_node() ->
+    gen_server:cast(?MODULE, register_node),
+    timer:sleep(2000),
+    register_node().
+
+connect_nodes() ->
+    gen_server:cast(?MODULE, connect_nodes),
+    timer:sleep(2000),
+    connect_nodes().
+
+registered_nodes() ->
+    gen_server:call(?MODULE, registered_nodes, 5000).
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
+%%--------------------------------------------------------------------
+%% Function: init(Args) -> {ok, State} |
+%%    {ok, State, Timeout} |
+%%    ignore                             |
+%%    {stop, Reason}
+%% Description: Initiates the server
+%%--------------------------------------------------------------------
+init([]) ->
     Opts = redis_opts(),
     log(debug, "Redis opts: ~p~n", [Opts]),
     {ok, Pid} = redo:start_link(undefined, Opts),
     BinNode = atom_to_binary(node(), utf8),
     Ip = local_ip(),
     Domain = domain(),
-    log(debug, "Loop args: node=~s ip=~s domain=~s~n", [BinNode, Ip, Domain]),
-    proc_lib:init_ack(Parent, {ok, self()}),
-    loop(Pid, BinNode, Ip, Domain).
+    Version = version(),
+    log(debug, "State: node=~s ip=~s domain=~s version=~s~n", [BinNode, Ip, Domain, Version]),
+    spawn_link(fun register_node/0),
+    spawn_link(fun connect_nodes/0),
+    {ok, #state{redis_cli = Pid,
+                bin_node = BinNode,
+                ip = Ip,
+                domain = Domain,
+                version = Version}}.
 
-loop(Pid, BinNode, Ip, Domain) ->
-    register_node(Pid, BinNode, Ip, Domain),
+%%--------------------------------------------------------------------
+%% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
+%%    {reply, Reply, State, Timeout} |
+%%    {noreply, State} |
+%%    {noreply, State, Timeout} |
+%%    {stop, Reason, Reply, State} |
+%%    {stop, Reason, State}
+%% Description: Handling call messages
+%%--------------------------------------------------------------------
+handle_call(registered_nodes, _From, #state{nodes=Nodes}=State) ->
+    {reply, Nodes, State};
+
+handle_call(_Msg, _From, State) ->
+    {reply, unknown_message, State}.
+
+%%--------------------------------------------------------------------
+%% Function: handle_cast(Msg, State) -> {noreply, State} |
+%%    {noreply, State, Timeout} |
+%%    {stop, Reason, State}
+%% Description: Handling cast messages
+%%--------------------------------------------------------------------
+handle_cast(register_node, #state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode}=State) ->
+    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
+    Cmd = [<<"SETEX">>, Key, <<"6">>, Ip],
+    <<"OK">> = redo:cmd(Pid, Cmd),
+    {noreply, State};
+
+handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
     Keys = get_node_keys(Pid, Domain),
-    [connect(Pid, Key, length(Domain)) || Key <- Keys],
-    receive
-        {nodedown, _Node} ->
-            ok
-    after 0 ->
-        ok
-    end,
-    timer:sleep(5 * 1000),
-    ?MODULE:loop(Pid, BinNode, Ip, Domain).
+    Nodes = lists:foldl(
+        fun(Key, Acc) ->
+            case connect(Pid, Key, length(Domain), length(Version)) of
+                undefined -> Acc;
+                Node -> [Node|Acc]
+            end
+        end, [], Keys),
+    {noreply, State#state{nodes=Nodes}};
 
-register_node(Pid, BinNode, Ip, Domain) ->
-    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, BinNode]),
-    Cmd = [<<"SETEX">>, Key, <<"10">>, Ip],
-    <<"OK">> = redo:cmd(Pid, Cmd).
+handle_cast(_Msg, State) ->
+    {noreply, State}.
 
+%%--------------------------------------------------------------------
+%% Function: handle_info(Info, State) -> {noreply, State} |
+%%    {noreply, State, Timeout} |
+%%    {stop, Reason, State}
+%% Description: Handling all non call/cast messages
+%%--------------------------------------------------------------------
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+%%--------------------------------------------------------------------
+%% Function: terminate(Reason, State) -> void()
+%% Description: This function is called by a gen_server when it is about to
+%% terminate. It should be the opposite of Module:init/1 and do any necessary
+%% cleaning up. When it returns, the gen_server terminates with Reason.
+%% The return value is ignored.
+%%--------------------------------------------------------------------
+terminate(_Reason, _State) ->
+    ok.
+
+%%--------------------------------------------------------------------
+%% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
+%% Description: Convert process state when code is changed
+%%--------------------------------------------------------------------
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
 get_node_keys(Pid, Domain) ->
     Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
     redo:cmd(Pid, [<<"KEYS">>, Val]).
 
-connect(Pid, Key, Size) ->
+connect(Pid, Key, DomainSize, VersionSize) ->
     case Key of
-        <<"redgrid:", _:Size/binary, ":", BinNode/binary>> ->
+        <<"redgrid:", _:DomainSize/binary, ":", _:VersionSize/binary, ":", BinNode/binary>> ->
             connect1(Pid, Key, binary_to_list(BinNode));
         _ ->
-            log(debug, "Attempting to connect to invalid key: ~s~n", [Key])
+            log(debug, "Attempting to connect to invalid key: ~s~n", [Key]),
+            undefined
     end.
 
 connect1(Pid, Key, StrNode) ->
     Node = list_to_atom(StrNode),
     case node() == Node of
         true ->
-            undefined;
+            node();
         false ->
             case net_adm:ping(Node) of
-                pong -> ok;
+                pong -> Node;
                 pang -> connect2(Pid, Key, StrNode, Node)
             end
     end.
@@ -85,7 +175,8 @@ connect2(Pid, Key, StrNode, Node) ->
         Ip when is_binary(Ip) ->
             connect3(StrNode, Node, Ip);
         Other ->
-            log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other])
+            log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other]),
+            undefined
     end.
 
 connect3(StrNode, Node, Ip) ->
@@ -95,10 +186,12 @@ connect3(StrNode, Node, Ip) ->
                 {match, [Host]} ->
                     connect4(Node, Addr, Host);   
                 Other ->
-                    log(debug, "Failed to parse host ~s: ~p~n", [StrNode, Other])
+                    log(debug, "Failed to parse host ~s: ~p~n", [StrNode, Other]),
+                    undefined
             end;
         Err ->
-            log(debug, "Failed to resolve ip ~s: ~p~n", [Ip, Err])
+            log(debug, "Failed to resolve ip ~s: ~p~n", [Ip, Err]),
+            undefined
     end.
 
 connect4(Node, Addr, Host) ->
@@ -106,9 +199,11 @@ connect4(Node, Addr, Host) ->
     case net_adm:ping(Node) of
         pong ->
             log(debug, "Monitoring node ~p~n", [Node]),
-            erlang:monitor_node(Node, true);
+            erlang:monitor_node(Node, true),
+            Node;
         pang ->
-            log(debug, "Ping failed ~p ~s -> ~p~n", [Node, Addr, Host])
+            log(debug, "Ping failed ~p ~s -> ~p~n", [Node, Addr, Host]),
+            Node
     end.
 
 get_node(Pid, Key) ->
@@ -126,6 +221,9 @@ local_ip() ->
 
 domain() ->
     env_var(domain, "DOMAIN", "").
+
+version() ->
+    env_var(version, "VERSION", "").
 
 env_var(AppKey, EnvName, Default) ->
     case application:get_env(?MODULE, AppKey) of
