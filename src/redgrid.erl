@@ -227,8 +227,8 @@ version() ->
 
 env_var(AppKey, EnvName, Default) ->
     case application:get_env(?MODULE, AppKey) of
-        {ok, Val} -> Val;
-        undefined ->
+        {ok, Val} when is_list(Val); is_binary(Val) -> Val;
+        _ ->
             case os:getenv(EnvName) of
                 false -> Default;
                 Val -> Val
