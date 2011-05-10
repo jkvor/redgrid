@@ -27,12 +27,19 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--export([start_link/0, register_node/0, connect_nodes/0, registered_nodes/0]).
+-export([start_link/0, start_link/1, update_meta/1,
+         register_node/0, connect_nodes/0, nodes/0]).
 
--record(state, {redis_cli, bin_node, ip, domain, version, nodes=[]}).
+-record(state, {redis_cli, bin_node, ip, domain, version, meta, nodes=[]}).
 
 start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+    start_link([]).
+
+start_link(Meta) when is_list(Meta) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [Meta], []).
+
+update_meta(Meta) when is_list(Meta) ->
+    gen_server:cast(?MODULE, {update_meta, Meta}).
 
 register_node() ->
     gen_server:cast(?MODULE, register_node),
@@ -44,8 +51,8 @@ connect_nodes() ->
     timer:sleep(2000),
     connect_nodes().
 
-registered_nodes() ->
-    gen_server:call(?MODULE, registered_nodes, 5000).
+nodes() ->
+    gen_server:call(?MODULE, nodes, 5000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -58,7 +65,7 @@ registered_nodes() ->
 %%    {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([]) ->
+init([Meta]) ->
     Opts = redis_opts(),
     log(debug, "Redis opts: ~p~n", [Opts]),
     {ok, Pid} = redo:start_link(undefined, Opts),
@@ -73,7 +80,8 @@ init([]) ->
                 bin_node = BinNode,
                 ip = Ip,
                 domain = Domain,
-                version = Version}}.
+                version = Version,
+                meta = Meta}}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -84,8 +92,9 @@ init([]) ->
 %%    {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call(registered_nodes, _From, #state{nodes=Nodes}=State) ->
-    {reply, Nodes, State};
+handle_call(nodes, _From, #state{ip=Ip, meta=Meta, nodes=Nodes}=State) ->
+    Node = {node(), [<<"ip">>, to_bin(Ip) | [to_bin(M) || M <- Meta]]},
+    {reply, [Node|Nodes], State};
 
 handle_call(_Msg, _From, State) ->
     {reply, unknown_message, State}.
@@ -96,22 +105,25 @@ handle_call(_Msg, _From, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast(register_node, #state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode}=State) ->
-    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
-    Cmd = [<<"SETEX">>, Key, <<"6">>, Ip],
-    <<"OK">> = redo:cmd(Pid, Cmd),
+handle_cast(register_node, State) ->
+    ok = register_node(State),
     {noreply, State};
 
-handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
+handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version, nodes=Nodes0}=State) ->
     Keys = get_node_keys(Pid, Domain),
     Nodes = lists:foldl(
         fun(Key, Acc) ->
-            case connect(Pid, Key, length(Domain), length(Version)) of
+            case connect(Pid, Key, length(Domain), length(Version), Nodes0) of
                 undefined -> Acc;
                 Node -> [Node|Acc]
             end
         end, [], Keys),
     {noreply, State#state{nodes=Nodes}};
+
+handle_cast({update_meta, Meta}, State) ->
+    State1 = State#state{meta=Meta},
+    ok = register_node(State1),
+    {noreply, State1};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -149,42 +161,60 @@ get_node_keys(Pid, Domain) ->
     Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
     redo:cmd(Pid, [<<"KEYS">>, Val]).
 
-connect(Pid, Key, DomainSize, VersionSize) ->
+connect(Pid, Key, DomainSize, VersionSize, Nodes) ->
     case Key of
         <<"redgrid:", _:DomainSize/binary, ":", _:VersionSize/binary, ":", BinNode/binary>> ->
-            connect1(Pid, Key, binary_to_list(BinNode));
+            connect1(Pid, Key, binary_to_list(BinNode), Nodes);
         _ ->
             log(debug, "Attempting to connect to invalid key: ~s~n", [Key]),
             undefined
     end.
 
-connect1(Pid, Key, StrNode) ->
+connect1(Pid, Key, StrNode, Nodes) ->
     Node = list_to_atom(StrNode),
     case node() == Node of
         true ->
-            node();
+            undefined;
         false ->
             case net_adm:ping(Node) of
-                pong -> Node;
+                pong ->
+                    case proplists:get_value(Node, Nodes) of
+                        undefined ->
+                            case get_node(Pid, Key) of
+                                Props when is_list(Props) ->
+                                    {Node, Props};
+                                Other ->
+                                    log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other]),
+                                    undefined
+                            end;
+                        Props ->
+                            {Node, Props}
+                    end;
                 pang -> connect2(Pid, Key, StrNode, Node)
             end
     end.
 
 connect2(Pid, Key, StrNode, Node) ->
     case get_node(Pid, Key) of
-        Ip when is_binary(Ip) ->
-            connect3(StrNode, Node, Ip);
+        Props when is_list(Props) ->
+            case proplists:get_value(<<"ip">>, Props) of
+                undefined ->
+                    log(debug, "Failed to retrieve IP from key props", []),
+                    undefined;
+                Ip ->
+                    connect3(StrNode, Node, Ip, Props)
+            end;
         Other ->
             log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other]),
             undefined
     end.
 
-connect3(StrNode, Node, Ip) ->
+connect3(StrNode, Node, Ip, Props) ->
     case inet:getaddr(binary_to_list(Ip), inet) of
         {ok, Addr} ->
             case re:run(StrNode, ".*@(.*)$", [{capture, all_but_first, list}]) of
                 {match, [Host]} ->
-                    connect4(Node, Addr, Host);   
+                    connect4(Node, Addr, Host, Props);   
                 Other ->
                     log(debug, "Failed to parse host ~s: ~p~n", [StrNode, Other]),
                     undefined
@@ -194,20 +224,26 @@ connect3(StrNode, Node, Ip) ->
             undefined
     end.
 
-connect4(Node, Addr, Host) ->
+connect4(Node, Addr, Host, Props) ->
     inet_db:add_host(Addr, [Host]),
     case net_adm:ping(Node) of
         pong ->
             log(debug, "Monitoring node ~p~n", [Node]),
             erlang:monitor_node(Node, true),
-            Node;
+            {Node, Props};
         pang ->
             log(debug, "Ping failed ~p ~s -> ~p~n", [Node, Addr, Host]),
-            Node
+            {Node, Props}
     end.
 
 get_node(Pid, Key) ->
-    redo:cmd(Pid, [<<"GET">>, Key]). 
+    redo:cmd(Pid, [<<"HGETALL">>, Key]). 
+
+register_node(#state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
+    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
+    Cmds = [["HMSET", Key, "ip", Ip | Meta], ["EXPIRE", Key, "6"]],
+    [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
+    ok.
 
 redis_opts() ->
     RedisUrl = redis_url(),
@@ -224,6 +260,15 @@ domain() ->
 
 version() ->
     env_var(version, "VERSION", "").
+
+to_bin(List) when is_list(List) ->
+    list_to_binary(List);
+
+to_bin(Bin) when is_binary(Bin) ->
+    Bin;
+
+to_bin(Int) when is_integer(Int) ->
+    to_bin(integer_to_list(Int)).
 
 env_var(AppKey, EnvName, Default) ->
     case application:get_env(?MODULE, AppKey) of
