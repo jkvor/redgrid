@@ -109,11 +109,11 @@ handle_cast(register_node, State) ->
     ok = register_node(State),
     {noreply, State};
 
-handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version, nodes=Nodes0}=State) ->
+handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
     Keys = get_node_keys(Pid, Domain),
     Nodes = lists:foldl(
         fun(Key, Acc) ->
-            case connect(Pid, Key, length(Domain), length(Version), Nodes0) of
+            case connect(Pid, Key, length(Domain), length(Version)) of
                 undefined -> Acc;
                 Node -> [Node|Acc]
             end
@@ -161,37 +161,22 @@ get_node_keys(Pid, Domain) ->
     Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
     redo:cmd(Pid, [<<"KEYS">>, Val]).
 
-connect(Pid, Key, DomainSize, VersionSize, Nodes) ->
+connect(Pid, Key, DomainSize, VersionSize) ->
     case Key of
         <<"redgrid:", _:DomainSize/binary, ":", _:VersionSize/binary, ":", BinNode/binary>> ->
-            connect1(Pid, Key, binary_to_list(BinNode), Nodes);
+            connect1(Pid, Key, binary_to_list(BinNode));
         _ ->
             log(debug, "Attempting to connect to invalid key: ~s~n", [Key]),
             undefined
     end.
 
-connect1(Pid, Key, StrNode, Nodes) ->
+connect1(Pid, Key, StrNode) ->
     Node = list_to_atom(StrNode),
     case node() == Node of
         true ->
             undefined;
         false ->
-            case net_adm:ping(Node) of
-                pong ->
-                    case proplists:get_value(Node, Nodes) of
-                        undefined ->
-                            case get_node(Pid, Key) of
-                                Props when is_list(Props) ->
-                                    {Node, Props};
-                                Other ->
-                                    log(debug, "Failed to lookup node ip with key ~s: ~p~n", [Key, Other]),
-                                    undefined
-                            end;
-                        Props ->
-                            {Node, Props}
-                    end;
-                pang -> connect2(Pid, Key, StrNode, Node)
-            end
+            connect2(Pid, Key, StrNode, Node)
     end.
 
 connect2(Pid, Key, StrNode, Node) ->
@@ -199,7 +184,7 @@ connect2(Pid, Key, StrNode, Node) ->
         Props when is_list(Props) ->
             case proplists:get_value(<<"ip">>, Props) of
                 undefined ->
-                    log(debug, "Failed to retrieve IP from key props", []),
+                    log(debug, "Failed to retrieve IP from key props ~p~n", [Props]),
                     undefined;
                 Ip ->
                     connect3(StrNode, Node, Ip, Props)
@@ -237,13 +222,34 @@ connect4(Node, Addr, Host, Props) ->
     end.
 
 get_node(Pid, Key) ->
-    redo:cmd(Pid, [<<"HGETALL">>, Key]). 
+    case redo:cmd(Pid, [<<"HGETALL">>, Key]) of
+        List when is_list(List) -> list_to_proplist(List);
+        Err -> Err
+    end.
 
 register_node(#state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
     Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
-    Cmds = [["HMSET", Key, "ip", Ip | Meta], ["EXPIRE", Key, "6"]],
+    Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "6"]],
     [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
     ok.
+
+flatten_proplist(Props) ->
+    flatten_proplist(Props, []).
+
+flatten_proplist([], Acc) ->
+    Acc;
+
+flatten_proplist([{Key, Val}|Tail], Acc) ->
+    flatten_proplist(Tail, [Key, Val | Acc]).
+
+list_to_proplist(List) ->
+    list_to_proplist(List, []).
+
+list_to_proplist([], Acc) ->
+    Acc;
+
+list_to_proplist([Key, Val|Tail], Acc) ->
+    list_to_proplist(Tail, [{Key, Val}|Acc]).
 
 redis_opts() ->
     RedisUrl = redis_url(),
