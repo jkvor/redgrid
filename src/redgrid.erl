@@ -27,32 +27,35 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--export([start_link/0, start_link/1, update_meta/1,
-         register_node/0, connect_nodes/0, nodes/0]).
+-export([start_link/0, start_link/1,
+         update_meta/1, update_meta/2,
+         nodes/0, nodes/1]).
 
--record(state, {redis_cli, bin_node, ip, domain, version, meta, nodes=[]}).
+-record(state, {pub_pid, sub_pid, pubsub_chan, sub_ref, bin_node,
+                ip, domain, version, meta, nodes}).
 
 start_link() ->
     start_link([]).
 
 start_link(Meta) when is_list(Meta) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [Meta], []).
+    case lists:member(anonymous, Meta) of
+        true ->
+            gen_server:start_link(?MODULE, [Meta], []);
+        false ->
+            gen_server:start_link({local, ?MODULE}, ?MODULE, [Meta], [])
+    end.
 
 update_meta(Meta) when is_list(Meta) ->
-    gen_server:cast(?MODULE, {update_meta, Meta}).
+    update_meta(?MODULE, Meta).
 
-register_node() ->
-    gen_server:cast(?MODULE, register_node),
-    timer:sleep(2000),
-    register_node().
-
-connect_nodes() ->
-    gen_server:cast(?MODULE, connect_nodes),
-    timer:sleep(2000),
-    connect_nodes().
+update_meta(NameOrPid, Meta) when is_list(Meta) ->
+    gen_server:cast(NameOrPid, {update_meta, Meta}).
 
 nodes() ->
-    gen_server:call(?MODULE, nodes, 5000).
+    ?MODULE:nodes(?MODULE).
+
+nodes(NameOrPid) ->
+    gen_server:call(NameOrPid, nodes, 5000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -66,22 +69,29 @@ nodes() ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([Meta]) ->
-    Opts = redis_opts(),
-    log(debug, "Redis opts: ~p~n", [Opts]),
-    {ok, Pid} = redo:start_link(undefined, Opts),
     BinNode = atom_to_binary(node(), utf8),
     Ip = local_ip(),
     Domain = domain(),
     Version = version(),
+
+    Opts = redo_uri:parse(proplists:get_value(redis_url, Meta, "redis://localhost:6379/")),
+    log(debug, "Redis opts: ~p~n", [Opts]),
+    {ok, Pub} = redo:start_link(undefined, Opts),
+    {ok, Sub} = redo:start_link(undefined, Opts),
+    Chan = pubsub_channel(Domain, Version),
+    Ref = redo:subscribe(Sub, Chan),
+
     log(debug, "State: node=~s ip=~s domain=~s version=~s~n", [BinNode, Ip, Domain, Version]),
-    spawn_link(fun register_node/0),
-    spawn_link(fun connect_nodes/0),
-    {ok, #state{redis_cli = Pid,
+    {ok, #state{pub_pid = Pub,
+                sub_pid = Sub,
+                pubsub_chan = Chan,
+                sub_ref = Ref,
                 bin_node = BinNode,
                 ip = Ip,
                 domain = Domain,
                 version = Version,
-                meta = Meta}}.
+                meta = Meta,
+                nodes = dict:new()}}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -94,7 +104,7 @@ init([Meta]) ->
 %%--------------------------------------------------------------------
 handle_call(nodes, _From, #state{ip=Ip, meta=Meta, nodes=Nodes}=State) ->
     Node = {node(), [<<"ip">>, to_bin(Ip) | [to_bin(M) || M <- Meta]]},
-    {reply, [Node|Nodes], State};
+    {reply, [Node|dict:to_list(Nodes)], State};
 
 handle_call(_Msg, _From, State) ->
     {reply, unknown_message, State}.
@@ -105,21 +115,6 @@ handle_call(_Msg, _From, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast(register_node, State) ->
-    ok = register_node(State),
-    {noreply, State};
-
-handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
-    Keys = get_node_keys(Pid, Domain),
-    Nodes = lists:foldl(
-        fun(Key, Acc) ->
-            case connect(Pid, Key, length(Domain), length(Version)) of
-                undefined -> Acc;
-                Node -> [Node|Acc]
-            end
-        end, [], Keys),
-    {noreply, State#state{nodes=Nodes}};
-
 handle_cast({update_meta, Meta}, State) ->
     State1 = State#state{meta=Meta},
     ok = register_node(State1),
@@ -134,6 +129,30 @@ handle_cast(_Msg, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info({Ref, [<<"subscribe">>, Chan, _Subscribers]}, #state{sub_ref=Ref, pubsub_chan=Chan}=State) ->
+    self() ! register,
+    ping_nodes(State),
+    {noreply, State};
+
+
+handle_info({Ref, [<<"message">>, Chan, <<"ping">>]}, #state{sub_ref=Ref, pubsub_chan=Chan}=State) ->
+    ok = register_node(State),
+    {noreply, State};
+
+handle_info({Ref, [<<"message">>, Chan, Key]}, #state{sub_ref=Ref, pubsub_chan=Chan, pub_pid=Pid, domain=Domain, version=Version, nodes=Nodes}=State) ->
+    case connect(Pid, Key, length(Domain), length(Version)) of
+        undefined ->
+            {noreply, State};
+        {Node, Meta} ->
+            Nodes1 = dict:store(Node, Meta, Nodes),
+            {noreply, State#state{nodes=Nodes1}}
+    end;
+
+handle_info(register, State) ->
+    ok = register_node(State),
+    erlang:send_after(10000, self(), register),
+    {noreply, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -157,9 +176,16 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
-get_node_keys(Pid, Domain) ->
-    Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
-    redo:cmd(Pid, [<<"KEYS">>, Val]).
+register_node(#state{pub_pid=Pid, pubsub_chan=Chan, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
+    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
+    Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "6"]],
+    [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
+    redo:cmd(Pid, ["PUBLISH", Chan, Key]),
+    ok.
+
+ping_nodes(#state{pub_pid=Pid, pubsub_chan=Chan}) ->
+    redo:cmd(Pid, ["PUBLISH", Chan, "ping"]),
+    ok.
 
 connect(Pid, Key, DomainSize, VersionSize) ->
     case Key of
@@ -227,12 +253,6 @@ get_node(Pid, Key) ->
         Err -> Err
     end.
 
-register_node(#state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
-    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
-    Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "6"]],
-    [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
-    ok.
-
 flatten_proplist(Props) ->
     flatten_proplist(Props, []).
 
@@ -251,13 +271,6 @@ list_to_proplist([], Acc) ->
 list_to_proplist([Key, Val|Tail], Acc) ->
     list_to_proplist(Tail, [{Key, Val}|Acc]).
 
-redis_opts() ->
-    RedisUrl = redis_url(),
-    redo_uri:parse(RedisUrl).
-
-redis_url() ->
-    env_var(redis_url, "REDIS_URL", "redis://localhost:6379/").
-
 local_ip() ->
     env_var(local_ip, "LOCAL_IP", "127.0.0.1").
 
@@ -267,11 +280,20 @@ domain() ->
 version() ->
     env_var(version, "VERSION", "").
 
+pubsub_channel(Domain, Version) ->
+    iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version]).
+
 to_bin(List) when is_list(List) ->
     list_to_binary(List);
 
 to_bin(Bin) when is_binary(Bin) ->
     Bin;
+
+to_bin(Atom) when is_atom(Atom) ->
+    to_bin(atom_to_list(Atom));
+
+to_bin(Tuple) when is_tuple(Tuple) ->
+    list_to_tuple([to_bin(T) || T <- tuple_to_list(Tuple)]);
 
 to_bin(Int) when is_integer(Int) ->
     to_bin(integer_to_list(Int)).
