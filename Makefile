@@ -1,5 +1,5 @@
 all: 
-	./rebar get-deps && ./rebar compile
+	./rebar get-deps update-deps compile
 
 clean:
 	./rebar clean

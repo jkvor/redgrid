@@ -1,9 +1,8 @@
 {application, redgrid,
  [
-  {description, "Erlang node manager (redis backend)"},
-  {vsn, "1"},
+  {description, "Automatic Erlang node discovery via Redis"},
+  {vsn, "1.1"},
   {registered, []},
   {applications, [kernel,stdlib]},
-  {mod, {redgrid_app, []}},
   {env, []}
  ]}.
