@@ -77,6 +77,8 @@ View registered nodes (including updated meta data for **bar**)
 
 ## Diagram
 
+This diagram demonstrates what's happening underneath the covers when the **foo** node joins a cluster comprised of a single node (**bar**).
+
 ![Redgrid](http://i.imgur.com/BbYxC.png)
 
 ## ENV VARS
