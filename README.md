@@ -75,6 +75,10 @@ View registered nodes (including updated meta data for **bar**)
                                                 {<<"weight">>, <<"50">>}]}]
 
 
+## Diagram
+
+![Redgrid](http://i.imgur.com/BbYxC.png)
+
 ## ENV VARS
 
     LOCAL_IP: The IP written to Redis to which other nodes will attempt to connect
