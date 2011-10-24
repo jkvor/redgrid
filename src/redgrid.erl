@@ -230,7 +230,7 @@ get_node(Pid, Key) ->
 register_node(#state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
     Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
     Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "6"]],
-    [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
+    redo:cmd(Pid, Cmds),
     ok.
 
 flatten_proplist(Props) ->
