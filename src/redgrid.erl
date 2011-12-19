@@ -27,8 +27,7 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--export([start_link/0, start_link/1, update_meta/1,
-         register_node/0, connect_nodes/0, nodes/0]).
+-export([start_link/0, start_link/1, update_meta/1, nodes/0]).
 
 -record(state, {redis_cli, bin_node, ip, domain, version, meta, nodes=[]}).
 
@@ -40,16 +39,6 @@ start_link(Meta) when is_list(Meta) ->
 
 update_meta(Meta) when is_list(Meta) ->
     gen_server:cast(?MODULE, {update_meta, Meta}).
-
-register_node() ->
-    gen_server:cast(?MODULE, register_node),
-    timer:sleep(2000),
-    register_node().
-
-connect_nodes() ->
-    gen_server:cast(?MODULE, connect_nodes),
-    timer:sleep(2000),
-    connect_nodes().
 
 nodes() ->
     gen_server:call(?MODULE, nodes, 5000).
@@ -74,14 +63,12 @@ init([Meta]) ->
     Domain = domain(),
     Version = version(),
     log(debug, "State: node=~s ip=~s domain=~s version=~s~n", [BinNode, Ip, Domain, Version]),
-    spawn_link(fun register_node/0),
-    spawn_link(fun connect_nodes/0),
     {ok, #state{redis_cli = Pid,
                 bin_node = BinNode,
                 ip = Ip,
                 domain = Domain,
                 version = Version,
-                meta = Meta}}.
+                meta = Meta}, 0}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -105,21 +92,6 @@ handle_call(_Msg, _From, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast(register_node, State) ->
-    ok = register_node(State),
-    {noreply, State};
-
-handle_cast(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
-    Keys = get_node_keys(Pid, Domain),
-    Nodes = lists:foldl(
-        fun(Key, Acc) ->
-            case connect(Pid, Key, length(Domain), length(Version)) of
-                undefined -> Acc;
-                Node -> [Node|Acc]
-            end
-        end, [], Keys),
-    {noreply, State#state{nodes=Nodes}};
-
 handle_cast({update_meta, Meta}, State) ->
     State1 = State#state{meta=Meta},
     ok = register_node(State1),
@@ -134,6 +106,28 @@ handle_cast(_Msg, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info(timeout, State) ->
+    self() ! register_node,
+    self() ! connect_nodes,
+    {noreply, State};
+
+handle_info(register_node, State) ->
+    ok = register_node(State),
+    erlang:send_after(2000, self(), register_node),
+    {noreply, State};
+
+handle_info(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
+    Keys = get_node_keys(Pid, Domain),
+    Nodes = lists:foldl(
+        fun(Key, Acc) ->
+            case connect(Pid, Key, length(Domain), length(Version)) of
+                undefined -> Acc;
+                Node -> [Node|Acc]
+            end
+        end, [], Keys),
+    erlang:send_after(2000, self(), connect_nodes),
+    {noreply, State#state{nodes=Nodes}};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
