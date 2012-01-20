@@ -291,14 +291,19 @@ log(MsgLvl, Fmt, Args) when is_integer(MsgLvl), is_list(Fmt), is_list(Args) ->
         end,
     MsgLvl >= SysLvl andalso error_logger:info_msg(Fmt, Args).
 
+log_to_int(debug) -> 0;
 log_to_int("debug") -> 0;
 log_to_int("0") -> 0;
+log_to_int(info) -> 1;
 log_to_int("info") -> 1;
 log_to_int("1") -> 1;
+log_to_int(warning) -> 2;
 log_to_int("warning") -> 2;
 log_to_int("2") -> 2;
+log_to_int(error) -> 3;
 log_to_int("error") -> 3;
 log_to_int("3") -> 3;
+log_to_int(fatal) -> 4;
 log_to_int("fatal") -> 4;
 log_to_int("4") -> 4;
 log_to_int(_) -> 1.
