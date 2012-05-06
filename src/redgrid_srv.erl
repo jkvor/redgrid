@@ -273,13 +273,14 @@ list_to_proplist([Key, Val|Tail], Acc) ->
     list_to_proplist(Tail, [{Key, Val}|Acc]).
 
 local_ip() ->
-    env_var(local_ip, "LOCAL_IP", "127.0.0.1").
+    get_env_default(local_ip, "").
 
 domain() ->
-    env_var(domain, "DOMAIN", "").
+    get_env_default(domain, "").
 
 version() ->
-    env_var(version, "VERSION", "").
+    get_env_default(version, "").
+
 
 pubsub_channel(Domain, Version) ->
     iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version]).
@@ -298,16 +299,6 @@ to_bin(Tuple) when is_tuple(Tuple) ->
 
 to_bin(Int) when is_integer(Int) ->
     to_bin(integer_to_list(Int)).
-
-env_var(AppKey, EnvName, Default) ->
-    case application:get_env(?MODULE, AppKey) of
-        {ok, Val} when is_list(Val); is_binary(Val) -> Val;
-        _ ->
-            case os:getenv(EnvName) of
-                false -> Default;
-                Val -> Val
-            end
-    end.
 
 get_env_default(Key, Default) ->
     case  application:get_env(Key) of
