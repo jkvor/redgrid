@@ -24,6 +24,5 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    io:format("sup~n"),
     {ok, {{one_for_one, 5, 10}, [?CHILD(redgrid_srv, worker)]}}.
 
