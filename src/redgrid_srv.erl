@@ -273,7 +273,7 @@ list_to_proplist([Key, Val|Tail], Acc) ->
     list_to_proplist(Tail, [{Key, Val}|Acc]).
 
 local_ip() ->
-    get_env_default(local_ip, "").
+    get_env_default(local_ip, "127.0.0.1").
 
 domain() ->
     get_env_default(domain, "").
