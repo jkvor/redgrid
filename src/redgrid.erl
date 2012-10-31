@@ -116,17 +116,21 @@ handle_info(register_node, State) ->
     erlang:send_after(2000, self(), register_node),
     {noreply, State};
 
-handle_info(connect_nodes, #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
-    Keys = get_node_keys(Pid, Domain),
-    Nodes = lists:foldl(
-        fun(Key, Acc) ->
-            case connect(Pid, Key, length(Domain), length(Version)) of
-                undefined -> Acc;
-                Node -> [Node|Acc]
-            end
-        end, [], Keys),
-    erlang:send_after(2000, self(), connect_nodes),
-    {noreply, State#state{nodes=Nodes}};
+handle_info(connect_nodes,
+            #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
+    case get_node_keys(Pid, Domain) of
+        {error, Err} ->
+            log(warning,
+                "at=get_node_keys err=~p "
+                "pid=~p domain=~p",
+                [Err, Pid, Domain]),
+            erlang:send_after(2000, self(), connect_nodes),
+            {noreply, State};
+        Keys ->
+            Nodes = connect_nodes(Keys, Pid, Domain, Version),
+            erlang:send_after(2000, self(), connect_nodes),
+            {noreply, State#state{nodes=Nodes}}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -155,6 +159,16 @@ get_node_keys(Pid, Domain) ->
     Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
     redo:cmd(Pid, [<<"KEYS">>, Val]).
 
+connect_nodes(Keys, Pid, Domain, Version) ->
+    lists:foldl(fun(Key, Acc) ->
+                        case connect(Pid, Key,
+                                     length(Domain), length(Version)) of
+                            undefined -> Acc;
+                            Node -> [Node|Acc]
+                        end
+                end, [], Keys).
+
+-spec connect(pid(), any(), any(), any()) -> 'undefined' | {atom(), list()}.
 connect(Pid, Key, DomainSize, VersionSize) ->
     case Key of
         <<"redgrid:", _:DomainSize/binary, ":", _:VersionSize/binary, ":", BinNode/binary>> ->
