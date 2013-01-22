@@ -136,7 +136,7 @@ handle_info({Ref, [<<"subscribe">>, Chan, _Subscribers]}, #state{sub_ref=Ref, pu
 
 
 handle_info({Ref, [<<"message">>, Chan, <<"ping">>]}, #state{sub_ref=Ref, pubsub_chan=Chan}=State) ->
-    ok = register_node(State),
+    register_node(State),
     {noreply, State};
 
 handle_info({Ref, [<<"message">>, Chan, Key]}, #state{sub_ref=Ref, pubsub_chan=Chan, pub_pid=Pid, domain=Domain, version=Version, nodes=Nodes}=State) ->
@@ -149,7 +149,7 @@ handle_info({Ref, [<<"message">>, Chan, Key]}, #state{sub_ref=Ref, pubsub_chan=C
     end;
 
 handle_info(register, State) ->
-    ok = register_node(State),
+    register_node(State),
     erlang:send_after(10000, self(), register),
     {noreply, State};
 
@@ -179,9 +179,12 @@ code_change(_OldVsn, State, _Extra) ->
 register_node(#state{pub_pid=Pid, pubsub_chan=Chan, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
     Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
     Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "60"]],
-    [<<"OK">>, 1] = redo:cmd(Pid, Cmds),
-    redo:cmd(Pid, ["PUBLISH", Chan, Key]),
-    ok.
+    case redo:cmd(Pid, Cmds) of
+        [<<"OK">>, 1] ->
+            redo:cmd(Pid, ["PUBLISH", Chan, Key]);
+        {error, Reason} ->
+            log(error, "Lost connection to redis: ~p~n", [Reason])
+    end.    
 
 ping_nodes(#state{pub_pid=Pid, pubsub_chan=Chan}) ->
     redo:cmd(Pid, ["PUBLISH", Chan, "ping"]),
