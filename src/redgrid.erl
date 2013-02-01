@@ -29,7 +29,7 @@
 
 -export([start_link/0, start_link/1, update_meta/1, nodes/0]).
 
--record(state, {redis_cli, bin_node, ip, domain, version, meta, nodes=[]}).
+-record(state, {redis_cli, opts, bin_node, ip, domain, version, meta, nodes=[]}).
 
 start_link() ->
     start_link([]).
@@ -55,6 +55,7 @@ nodes() ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([Meta]) ->
+    process_flag(trap_exit, true),
     Opts = redis_opts(),
     log(debug, "Redis opts: ~p~n", [Opts]),
     {ok, Pid} = redo:start_link(undefined, Opts),
@@ -64,6 +65,7 @@ init([Meta]) ->
     Version = version(),
     log(debug, "State: node=~s ip=~s domain=~s version=~s~n", [BinNode, Ip, Domain, Version]),
     {ok, #state{redis_cli = Pid,
+                opts=Opts,
                 bin_node = BinNode,
                 ip = Ip,
                 domain = Domain,
@@ -132,8 +134,14 @@ handle_info(connect_nodes,
             {noreply, State#state{nodes=Nodes}}
     end;
 
+handle_info({'EXIT', Pid, Reason}, State=#state{redis_cli=Pid, opts=Opts}) ->
+    log(warning,"at=handle_info err=exit reason=~p", [Reason]),
+    {ok, Pid2} = redo:start_link(undefined, Opts),
+    {noreply, State#state{redis_cli=Pid2}};
+
 handle_info(_Info, State) ->
     {noreply, State}.
+
 
 %%--------------------------------------------------------------------
 %% Function: terminate(Reason, State) -> void()
