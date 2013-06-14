@@ -230,7 +230,6 @@ connect4(Node, Addr, Host, Props) ->
     case net_adm:ping(Node) of
         pong ->
             log(debug, "Monitoring node ~p~n", [Node]),
-            erlang:monitor_node(Node, true),
             {Node, Props};
         pang ->
             log(debug, "Ping failed ~p ~s -> ~p~n", [Node, Addr, Host]),
