@@ -27,9 +27,11 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--export([start_link/0, start_link/1, update_meta/1, nodes/0]).
+-export([start_link/0, start_link/1, update_meta/1, nodes/0,
+         suspend/0, resume/0]).
 
--record(state, {redis_cli, opts, bin_node, ip, domain, version, meta, nodes=[]}).
+-record(state, {redis_cli, opts, bin_node, ip, domain, version, meta, nodes=[],
+                status=normal}).
 
 start_link() ->
     start_link([]).
@@ -42,6 +44,12 @@ update_meta(Meta) when is_list(Meta) ->
 
 nodes() ->
     gen_server:call(?MODULE, nodes, 5000).
+
+suspend() ->
+    gen_server:call(?MODULE, suspend, 5000).
+
+resume() ->
+    gen_server:call(?MODULE, resume, 5000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -81,11 +89,20 @@ init([Meta]) ->
 %%    {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
+handle_call(suspend, _From, State = #state{}) ->
+    ok = unregister_node(State),
+    {reply, ok, State#state{status=suspended}};
+
+handle_call(resume, _From, S=#state{status=suspended}) ->
+    self() ! register_node,
+    self() ! connect_nodes,
+    {reply, ok, S#state{status=normal}};
+
 handle_call(nodes, _From, #state{ip=Ip, meta=Meta, nodes=Nodes}=State) ->
     Node = {node(), [<<"ip">>, to_bin(Ip) | [to_bin(M) || M <- Meta]]},
     {reply, [Node|Nodes], State};
 
-handle_call(_Msg, _From, State) ->
+handle_call(_Msg, _From, State = #state{}) ->
     {reply, unknown_message, State}.
 
 %%--------------------------------------------------------------------
@@ -94,12 +111,17 @@ handle_call(_Msg, _From, State) ->
 %%    {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast({update_meta, Meta}, State) ->
+handle_cast({update_meta, Meta}, State = #state{status=suspended}) ->
+    State1 = State#state{meta=Meta},
+    {noreply, State1};
+
+handle_cast({update_meta, Meta}, State = #state{}) ->
     State1 = State#state{meta=Meta},
     ok = register_node(State1),
     {noreply, State1};
 
-handle_cast(_Msg, State) ->
+
+handle_cast(_Msg, State = #state{}) ->
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -113,13 +135,13 @@ handle_info(timeout, State) ->
     self() ! connect_nodes,
     {noreply, State};
 
-handle_info(register_node, State) ->
+handle_info(register_node, State = #state{status=normal}) ->
     ok = register_node(State),
     erlang:send_after(2000, self(), register_node),
     {noreply, State};
 
 handle_info(connect_nodes,
-            #state{redis_cli=Pid, domain=Domain, version=Version}=State) ->
+            #state{redis_cli=Pid, domain=Domain, version=Version, status=normal}=State) ->
     case get_node_keys(Pid, Domain) of
         {error, Err} ->
             log(warning,
@@ -139,7 +161,7 @@ handle_info({'EXIT', Pid, Reason}, State=#state{redis_cli=Pid, opts=Opts}) ->
     {ok, Pid2} = redo:start_link(undefined, Opts),
     {noreply, State#state{redis_cli=Pid2}};
 
-handle_info(_Info, State) ->
+handle_info(_Info, State = #state{}) ->
     {noreply, State}.
 
 
@@ -158,7 +180,11 @@ terminate(_Reason, _State) ->
 %% Description: Convert process state when code is changed
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    if tuple_size(State) + 1 =:= tuple_size(#state{}) -> % old state
+           {ok, list_to_tuple(tuple_to_list(State)++[normal])};
+       tuple_size(State) =:= tuple_size(#state{}) -> % current?
+           {ok, State}
+    end.
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -245,6 +271,12 @@ get_node(Pid, Key) ->
 register_node(#state{redis_cli=Pid, ip=Ip, domain=Domain, version=Version, bin_node=BinNode, meta=Meta}) ->
     Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
     Cmds = [["HMSET", Key, "ip", Ip | flatten_proplist(Meta)], ["EXPIRE", Key, "120"]],
+    redo:cmd(Pid, Cmds),
+    ok.
+
+unregister_node(#state{redis_cli=Pid, domain=Domain, version=Version, bin_node=BinNode}) ->
+    Key = iolist_to_binary([<<"redgrid:">>, Domain, <<":">>, Version, <<":">>, BinNode]),
+    Cmds = [["DEL", Key]],
     redo:cmd(Pid, Cmds),
     ok.
 
