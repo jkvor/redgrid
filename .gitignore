@@ -3,3 +3,5 @@ ebin
 src/*.swp
 erl_crash.dump
 deps
+test/*.beam
+logs
