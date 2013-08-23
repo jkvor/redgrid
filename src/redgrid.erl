@@ -31,7 +31,7 @@
          suspend/0, resume/0]).
 
 -record(state, {redis_cli, opts, bin_node, ip, domain, version, meta, nodes=[],
-                status=normal}).
+                status=normal, backoff}).
 
 start_link() ->
     start_link([]).
@@ -66,19 +66,18 @@ init([Meta]) ->
     process_flag(trap_exit, true),
     Opts = redis_opts(),
     log(debug, "Redis opts: ~p~n", [Opts]),
-    {ok, Pid} = redo:start_link(undefined, Opts),
+    {_Status, State} = redo_connect(#state{opts=Opts, backoff=backoff()}),
     BinNode = atom_to_binary(node(), utf8),
     Ip = local_ip(),
     Domain = domain(),
     Version = version(),
     log(debug, "State: node=~s ip=~s domain=~s version=~s~n", [BinNode, Ip, Domain, Version]),
-    {ok, #state{redis_cli = Pid,
-                opts=Opts,
-                bin_node = BinNode,
-                ip = Ip,
-                domain = Domain,
-                version = Version,
-                meta = Meta}, 0}.
+    {ok, State#state{opts=Opts,
+                     bin_node = BinNode,
+                     ip = Ip,
+                     domain = Domain,
+                     version = Version,
+                     meta = Meta}, 0}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -89,9 +88,18 @@ init([Meta]) ->
 %%    {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call(suspend, _From, State = #state{}) ->
-    ok = unregister_node(State),
-    {reply, ok, State#state{status=suspended}};
+handle_call(suspend, _From, State = #state{redis_cli=Pid}) ->
+    %% We can be suspended without having had time to
+    %% delete our own entry due to not being connected. In such a
+    %% case, we may want to notify the receiver of what is going on
+    %% so that they are more careful.
+    case Pid of
+        undefined ->
+            {reply, {ok,no_delete}, State#state{status=suspended}};
+        Pid when is_pid(Pid) ->
+            ok = unregister_node(State),
+            {reply, ok, State#state{status=suspended}}
+    end;
 
 handle_call(resume, _From, S=#state{status=suspended}) ->
     self() ! register_node,
@@ -114,7 +122,9 @@ handle_call(_Msg, _From, State = #state{}) ->
 handle_cast({update_meta, Meta}, State = #state{status=suspended}) ->
     State1 = State#state{meta=Meta},
     {noreply, State1};
-
+handle_cast({update_meta, Meta}, State = #state{redis_cli=undefined}) ->
+    State1 = State#state{meta=Meta},
+    {noreply, State1};
 handle_cast({update_meta, Meta}, State = #state{}) ->
     State1 = State#state{meta=Meta},
     ok = register_node(State1),
@@ -135,11 +145,19 @@ handle_info(timeout, State) ->
     self() ! connect_nodes,
     {noreply, State};
 
+handle_info(register_node, State = #state{redis_cli=undefined, status=normal}) ->
+    %% Not currently connected. Skip ahead until reconnect.
+    erlang:send_after(2000, self(), register_node),
+    {noreply, State};
 handle_info(register_node, State = #state{status=normal}) ->
     ok = register_node(State),
     erlang:send_after(2000, self(), register_node),
     {noreply, State};
 
+handle_info(connect_nodes, State=#state{redis_cli=undefined, status=normal}) ->
+    %% Not currently connected. Skip ahead until reconnect.
+    erlang:send_after(2000, self(), connect_nodes),
+    {noreply, State};
 handle_info(connect_nodes,
             #state{redis_cli=Pid, domain=Domain, version=Version, status=normal}=State) ->
     case get_node_keys(Pid, Domain) of
@@ -156,10 +174,14 @@ handle_info(connect_nodes,
             {noreply, State#state{nodes=Nodes}}
     end;
 
-handle_info({'EXIT', Pid, Reason}, State=#state{redis_cli=Pid, opts=Opts}) ->
+handle_info({'EXIT', Pid, Reason}, State=#state{redis_cli=Pid}) ->
     log(warning,"at=handle_info err=exit reason=~p", [Reason]),
-    {ok, Pid2} = redo:start_link(undefined, Opts),
-    {noreply, State#state{redis_cli=Pid2}};
+    {_Status, NewState} = redo_connect(State),
+    {noreply, NewState};
+
+handle_info({timeout, _Tref, reconnect_redo}, State=#state{}) ->
+    {_Status, NewState} = redo_connect(State),
+    {noreply, NewState};
 
 handle_info(_Info, State = #state{}) ->
     {noreply, State}.
@@ -180,8 +202,10 @@ terminate(_Reason, _State) ->
 %% Description: Convert process state when code is changed
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
-    if tuple_size(State) + 1 =:= tuple_size(#state{}) -> % old state
-           {ok, list_to_tuple(tuple_to_list(State)++[normal])};
+    if tuple_size(State) + 2 =:= tuple_size(#state{}) -> % oldest state
+           {ok, list_to_tuple(tuple_to_list(State)++[normal, backoff()])};
+       tuple_size(State) + 1 =:= tuple_size(#state{}) -> % older state
+           {ok, list_to_tuple(tuple_to_list(State)++[backoff()])};
        tuple_size(State) =:= tuple_size(#state{}) -> % current?
            {ok, State}
     end.
@@ -189,6 +213,29 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+redo_connect(State=#state{redis_cli=Pid, opts=Opts, backoff=Backoff}) ->
+    case is_pid(Pid) andalso erlang:is_process_alive(Pid) of
+        true ->
+            log(info, "shutting down old connection on reconnect~n", []),
+            unlink(Pid), % we don't want 'EXIT' from this.
+            exit(Pid, shutdown);
+        false ->
+            ok
+    end,
+    case redo:start_link(undefined, Opts) of
+        % ignore -> not expected, let's crash!
+        {error, Reason} ->
+            Delay = backoff:fire(Backoff),
+            log(error, "connection failed for reason ~p, retrying in ~pms~n",
+                [Reason, Delay]),
+            {_, NewBackoff} = backoff:fail(Backoff),
+            {disconnected, State#state{redis_cli=undefined, backoff=NewBackoff}};
+        {ok, NewPid} ->
+            log(info, "reconnection successful.~n", []),
+            {_, NewBackoff} = backoff:succeed(Backoff),
+            {connected, State#state{redis_cli=NewPid, backoff=NewBackoff}}
+    end.
+
 get_node_keys(Pid, Domain) ->
     Val = iolist_to_binary([<<"redgrid:">>, Domain, <<":*">>]),
     redo:cmd(Pid, [<<"KEYS">>, Val]).
@@ -279,6 +326,10 @@ unregister_node(#state{redis_cli=Pid, domain=Domain, version=Version, bin_node=B
     Cmds = [["DEL", Key]],
     redo:cmd(Pid, Cmds),
     ok.
+
+backoff() ->
+    backoff:init(timer:seconds(1), timer:seconds(120),
+                 self(), reconnect_redo).
 
 flatten_proplist(Props) ->
     flatten_proplist(Props, []).
