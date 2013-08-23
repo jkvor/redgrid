@@ -28,7 +28,7 @@
          handle_info/2, terminate/2, code_change/3]).
 
 -export([start_link/0, start_link/1, update_meta/1, nodes/0,
-         suspend/0, resume/0]).
+         suspend/0, resume/0, reload_config/0]).
 
 -record(state, {redis_cli, opts, bin_node, ip, domain, version, meta, nodes=[],
                 status=normal, backoff}).
@@ -45,11 +45,23 @@ update_meta(Meta) when is_list(Meta) ->
 nodes() ->
     gen_server:call(?MODULE, nodes, 5000).
 
+-spec suspend() -> 'ok' | {'ok', 'no_delete'}.
 suspend() ->
     gen_server:call(?MODULE, suspend, 5000).
 
 resume() ->
     gen_server:call(?MODULE, resume, 5000).
+
+%% This function reloads configuration and then resets the connection.
+%% It however expects the correct config value to already be in memory
+%% in application:env vars, and will not seek to disk for such information.
+%% A seek to disk can be forced by manually unsetting the configuration as
+%% application:set_env(redgrid, redis_url, undefined).
+%%
+%% For this call to succeed, the redgrid process must be suspended.
+-spec reload_config() -> 'ok' | {'error', Reason::term()}.
+reload_config() ->
+    gen_server:call(?MODULE, reload_config, 5000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -109,6 +121,23 @@ handle_call(resume, _From, S=#state{status=suspended}) ->
 handle_call(nodes, _From, #state{ip=Ip, meta=Meta, nodes=Nodes}=State) ->
     Node = {node(), [<<"ip">>, to_bin(Ip) | [to_bin(M) || M <- Meta]]},
     {reply, [Node|Nodes], State};
+
+handle_call(reload_config, _From, S = #state{status=normal}) ->
+    {reply, {error, redgrid_must_be_suspended}, S};
+handle_call(reload_config, _From, S = #state{status=suspended}) ->
+    log(info, "Reloading redis config.~n",[]),
+    Opts = redis_opts(),
+    log(debug, "Redis opts: ~p~n", [Opts]),
+    {_Status, State} = redo_connect(S#state{opts=Opts, backoff=backoff()}),
+    BinNode = atom_to_binary(node(), utf8),
+    Ip = local_ip(),
+    Domain = domain(),
+    Version = version(),
+    {reply, ok, State#state{bin_node=BinNode,
+                            ip=Ip,
+                            domain=Domain,
+                            version=Version}};
+
 
 handle_call(_Msg, _From, State = #state{}) ->
     {reply, unknown_message, State}.
